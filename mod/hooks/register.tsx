@@ -183,6 +183,10 @@ let lastBackground = { tasks: 0, crons: 0 };
 let resumed = false;
 /** Whether the conversation's last turn was interrupted: the person is there, redirecting. */
 let interrupted = false;
+/** Whether the conversation has a turn under way. The figures of a turn's last response
+ *  can arrive after the Stop that ended it, so a move planned while none is under way is
+ *  made at once rather than at the next turn's end. */
+let isTurnActive = false;
 
 async function snapshot($: EngineInterface): Promise<View | undefined> {
   return current ? { current, others, live: live ?? null, now: await $.clock.now() } : undefined;
@@ -280,8 +284,13 @@ async function offerMove($: EngineInterface, window: SessionRateLimit, now: numb
   const isBusy = lastBackground.tasks > 0 || lastBackground.crons > 0;
   if (autoAt !== undefined && !(isTurnOver && isBusy)) {
     pendingMove = { to: name, window };
-    $.ui.toast(`${head} Moving this conversation to ${where}${isTurnOver ? '' : ' once this turn ends'}.`, { timeoutMs: 30_000 });
+    const isIdle = isTurnOver || !isTurnActive;
+    $.ui.toast(`${head} Moving this conversation to ${where}${isIdle ? '' : ' once this turn ends'}.`, { timeoutMs: 30_000 });
     if (isTurnOver) $.clock.after(0, () => void moveNow($, { tasks: 0, crons: 0 }));
+    else if (isIdle) {
+      const background = lastBackground;
+      $.clock.after(0, () => void moveNow($, background));
+    }
     return;
   }
 
@@ -350,12 +359,16 @@ function planAutoMove($: EngineInterface, window: SessionRateLimit, now: number)
   const [name, usage] = next;
   if (pendingMove?.to !== name) {
     $.ui.toast(
-      `${head} Moving this conversation to ${name} (5h ${pct(usage.fiveHourPct)}%, 7d ${pct(usage.weeklyPct)}%) once this turn ends.`,
+      `${head} Moving this conversation to ${name} (5h ${pct(usage.fiveHourPct)}%, 7d ${pct(usage.weeklyPct)}%)${isTurnActive ? ' once this turn ends' : ''}.`,
       { timeoutMs: 15_000 },
     );
   }
   // The fuller window is the one aimux is told about.
   if (pendingMove?.to !== name || window.percentUsed >= pendingMove.window.percentUsed) pendingMove = { to: name, window };
+  if (!isTurnActive) {
+    const background = lastBackground;
+    $.clock.after(0, () => void moveNow($, background));
+  }
 }
 
 /**
@@ -493,13 +506,22 @@ export const register: Register = (on) => {
   // The conversation's turn ended — not a subagent's (SubagentStop): the one safe moment
   // to move, with the background work still in flight in hand. An interrupted turn
   // (`turn.complete`, above) is not: the person is there, about to type.
+  on('turn.start', async ($, e, next) => {
+    if (e.agentId === undefined) isTurnActive = true;
+    return next(e);
+  });
+
   on('turn.complete', async ($, e, next) => {
-    if (e.agentId === undefined) interrupted = e.isAborted || e.reason === 'aborted';
+    if (e.agentId === undefined) {
+      interrupted = e.isAborted || e.reason === 'aborted';
+      isTurnActive = false;
+    }
     return next(e);
   });
 
   on('classic.Stop', async ($, e, next) => {
     lastBackground = { tasks: e.background_tasks?.length ?? 0, crons: e.session_crons?.length ?? 0 };
+    isTurnActive = false;
     if (current && pendingMove) {
       const background = lastBackground;
       $.clock.after(0, () => void moveNow($, background));

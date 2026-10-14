@@ -25,6 +25,7 @@ function engineBeneath(on: On, commands: string[] = [], opts: { refuseExit?: boo
   on('session.measure', (_$, e) => ({ changed: e.changed }));
   on('classic.Stop', () => ({}));
   on('turn.complete', (_$, e) => ({ text: e.answer }));
+  on('turn.start', (_$, e) => ({ turnId: e.turnId }));
   on('command.run', (_$, e) => {
     if (opts.refuseExit && e.command === 'exit') throw new Error('not from here');
     commands.push(e.command);
@@ -380,12 +381,14 @@ describe('aimux mod — moving on its own (continuation.auto_at)', () => {
     agents?: { status: string }[]; refuseExit?: boolean;
   };
 
-  /** A session aimux launched with auto_at 95, past its first reading of the others. */
+  /** A session aimux launched with auto_at 95, past its first reading of the others,
+   *  with a turn under way. */
   async function started($: Engine, on: On, args: Setup = {}) {
     const clock = mock.clock(on, { now: Date.parse('2026-10-04T15:50:00Z') });
     const seen = launchedByAimux(on, args.answer, args.draft, args.windows, { ...AUTO, ...args.env }, args.agents, { refuseExit: args.refuseExit });
     await $.session.start(START);
     await clock.settle();
+    await $.turn.start({ text: 'go on', turnId: 't1' });
     return { clock, seen };
   }
 
@@ -494,6 +497,19 @@ describe('aimux mod — moving on its own (continuation.auto_at)', () => {
     await $.classic.Stop(stop());
     await clock.settle();
     expect(seen.commands).toEqual(['exit']);
+  });
+
+  test('a turn\'s last figures arriving after its Stop move it at once, not a turn later', async ($, on) => {
+    const { clock, seen } = await started($, on);
+
+    await $.classic.Stop(stop());
+    await clock.settle();
+    expect(seen.commands).toEqual([]);
+
+    await $.session.measure(measure([{ kind: 'seven_day', percentUsed: 96, resetsAt: 'w1' }]));
+    await clock.settle();
+    expect(seen.commands).toEqual(['exit']);
+    expect(seen.toasts).toEqual(['dt has used 96% of its weekly window. Moving this conversation to main (5h 13%, 7d 17%).']);
   });
 
   test('two turn ends in a row make one move', async ($, on) => {
