@@ -25,6 +25,15 @@ export interface AimuxConfig {
   profiles: Record<string, ProfileConfig>;
   private: string[];
   bindings?: ProjectBinding[];
+  continuation?: ContinuationConfig;
+}
+
+/** How a session moves to another subscription as its own runs low. */
+export interface ContinuationConfig {
+  /** Move on its own, without asking, once a window of this session's subscription has
+   *  used this percentage (1–100): after the turn that crossed it ends, and only to a
+   *  subscription whose every window is below it. Absent: ask once a window is spent. */
+  auto_at?: number;
 }
 
 

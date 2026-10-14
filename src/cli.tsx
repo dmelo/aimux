@@ -83,12 +83,23 @@ function askYes(question: string): boolean {
  * to move the session to (they ran the `/exit` it offered once theirs ran out), or
  * nothing. Read once: the file goes with it.
  */
-function takeHandoff(path: string): string | undefined {
-  if (!existsSync(path)) return undefined;
+function takeHandoff(path: string): { profile?: string; auto: boolean } {
+  if (!existsSync(path)) return { auto: false };
 
-  const profile = readFileSync(path, 'utf-8').trim();
+  const text = readFileSync(path, 'utf-8').trim();
   rmSync(path, { force: true });
-  return profile || undefined;
+
+  // The mod writes JSON when it ended the session on its own (`continuation.auto_at`),
+  // a bare profile name when the person ran the /exit it offered.
+  if (text.startsWith('{')) {
+    try {
+      const { profile, auto } = JSON.parse(text) as { profile?: unknown; auto?: unknown };
+      return { profile: typeof profile === 'string' && profile ? profile : undefined, auto: auto === true };
+    } catch {
+      return { auto: false };
+    }
+  }
+  return { profile: text || undefined, auto: false };
 }
 
 
@@ -471,7 +482,8 @@ program
       // session another terminal runs under the same profile. Without that record: the id
       // the args name, then (in planContinuation) the transcript this profile wrote last.
       // `moveAgreed`: the person already said yes inside claude, by running the mod's /exit.
-      const launch = async (profile: string, extraArgs: string[]) => {
+      const autoAt = config.continuation?.auto_at;
+      const launch = async (profile: string, extraArgs: string[], opts: { holdAuto?: boolean } = {}) => {
         let follower: ReturnType<typeof followProcessSession> | undefined;
         const since = Date.now();
         const handoff = withMod ? join(getAimuxDir(), 'handoff', `${process.pid}-${launches++}`) : undefined;
@@ -484,6 +496,7 @@ program
               // execArgv too: under tsx (npm run dev) the loader flags are what run a .tsx entry
               AIMUX_SELF: JSON.stringify([process.execPath, ...process.execArgv, process.argv[1]]),
               AIMUX_HANDOFF: handoff,
+              ...(autoAt !== undefined && !opts.holdAuto ? { AIMUX_AUTO_AT: String(autoAt) } : {}),
             }
             : undefined,
           onSpawn: continuable
@@ -492,14 +505,21 @@ program
         });
         follower?.stop();
 
-        const moveAgreed = handoff ? takeHandoff(handoff) : undefined;
-        return { code, since, moveAgreed, sessionId: follower?.current() ?? sessionIdFromArgs(extraArgs) };
+        const agreed = handoff ? takeHandoff(handoff) : { auto: false };
+        return {
+          code,
+          since,
+          moveAgreed: agreed.profile,
+          autoMoved: agreed.auto,
+          sessionId: follower?.current() ?? sessionIdFromArgs(extraArgs),
+        };
       };
 
       const exitCode = await runWithContinuation(profileName, cliArgs, continuable, {
         prepare,
         launch,
-        plan: (name, session) => planContinuation(config, name, session),
+        plan: (name, session) => planContinuation(config, name, session, undefined, undefined,
+          { autoAt: session.autoMoved ? autoAt : undefined }),
         ask: askYes,
         say: (line) => console.error(line),
       });

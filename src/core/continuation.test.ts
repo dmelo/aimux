@@ -1,14 +1,20 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { AimuxConfig } from '../types/index.js';
 import type { RateLimitProbe } from './limits.js';
 import { continuationArgs, planContinuation, runWithContinuation, sessionIdFromArgs, type ContinuationPlan, type RunDeps } from './continuation.js';
+import { resetAimuxDir, setAimuxDir } from './paths.js';
 
 let root: string;
-beforeEach(() => { root = mkdtempSync(join(tmpdir(), 'aimux-continue-')); });
-afterEach(() => { rmSync(root, { recursive: true, force: true }); });
+beforeEach(() => {
+  root = mkdtempSync(join(tmpdir(), 'aimux-continue-'));
+  // The early path refreshes the shared limits reading: keep it out of the real ~/.aimux.
+  setAimuxDir(join(root, 'aimux'));
+  mkdirSync(join(root, 'aimux'), { recursive: true });
+});
+afterEach(() => { resetAimuxDir(); rmSync(root, { recursive: true, force: true }); });
 
 const source = () => join(root, 'claude');
 const profileDir = (name: string) => join(root, 'profiles', name);
@@ -91,6 +97,55 @@ describe('planContinuation', () => {
     const plan = await planContinuation(config(), 'work', { since: 0 }, async () => { calls++; return status(0, 0); });
     expect(plan).toBeNull();
     expect(calls).toBe(0);
+  });
+});
+
+describe('planContinuation — moving early (continuation.auto_at)', () => {
+  const ordinaryEnd = { type: 'assistant', message: { model: 'claude-opus-5-5', role: 'assistant', content: [] } };
+  const byProfile = (figures: Record<string, RateLimitProbe>) =>
+    async (_p: unknown, path: string) => figures[path.split('/').at(-1) ?? ''] ?? status(0, 0);
+
+  it('moves a session with no spent window once the mod ended it at the line', async () => {
+    sessionEndingWith(ordinaryEnd);
+    const probe = byProfile({ work: status(96, 40), spare: status(10, 20), busy: status(50, 97), claude: status(60, 60) });
+
+    const plan = await planContinuation(config(), 'work', { since: 0 }, probe, Date.now(), { autoAt: 95 });
+
+    expect(plan?.sessionId).toBe('sess-1');
+    expect(plan?.early).toBe(96);
+    expect(plan?.hit.rateLimitType).toBe('five_hour');
+    // busy has the emptiest 5-hour window but sits past the line on its week.
+    expect(plan?.next?.profile).toBe('spare');
+  });
+
+  it('offers nowhere that is itself at the line', async () => {
+    sessionEndingWith(ordinaryEnd);
+    const probe = byProfile({ work: status(96, 40), spare: status(95, 1), busy: status(1, 99), claude: status(100, 0) });
+    const plan = await planContinuation(config(), 'work', { since: 0 }, probe, Date.now(), { autoAt: 95 });
+    expect(plan?.next).toBeNull();
+  });
+
+  it('stays when a fresh reading has this subscription back under the line', async () => {
+    sessionEndingWith(ordinaryEnd);
+    const probe = byProfile({ work: status(4, 40), spare: status(10, 20) });
+    expect(await planContinuation(config(), 'work', { since: 0 }, probe, Date.now(), { autoAt: 95 })).toBeNull();
+  });
+
+  it('still moves nothing early unless the mod asked for it', async () => {
+    sessionEndingWith(ordinaryEnd);
+    let calls = 0;
+    const plan = await planContinuation(config(), 'work', { since: 0 }, async () => { calls++; return status(99, 99); });
+    expect(plan).toBeNull();
+    expect(calls).toBe(0);
+  });
+
+  it('leaves the reading every session shares fresh', async () => {
+    sessionEndingWith(ordinaryEnd);
+    const now = Date.now();
+    await planContinuation(config(), 'work', { since: 0 }, byProfile({ work: status(96, 1) }), now, { autoAt: 95 });
+    const cached = JSON.parse(readFileSync(join(root, 'aimux', 'limits-cache.json'), 'utf-8'));
+    expect(cached.fetchedAt).toBe(now);
+    expect(cached.profiles.work.status.fiveHourPct).toBe(96);
   });
 });
 
@@ -177,13 +232,19 @@ describe('runWithContinuation', () => {
   const room = (profile: string) => ({ profile, status: { fiveHourPct: 10, weeklyPct: 20 } });
 
   /** A run whose launches exit with `codes` in turn, and whose sessions hit a limit per `plans`. */
-  function scripted(plans: Array<ContinuationPlan | null>, opts: { answer?: boolean; agreed?: string[]; codes?: number[] } = {}) {
-    const seen = { launches: [] as Array<[string, string[]]>, prepared: [] as string[], asked: [] as string[], said: [] as string[] };
+  function scripted(
+    plans: Array<ContinuationPlan | null>,
+    opts: { answer?: boolean; agreed?: string[]; codes?: number[]; auto?: boolean[] } = {},
+  ) {
+    const seen = {
+      launches: [] as Array<[string, string[]]>, held: [] as boolean[], prepared: [] as string[], asked: [] as string[], said: [] as string[],
+    };
     const deps: RunDeps = {
       prepare: (profile) => { seen.prepared.push(profile); },
-      launch: async (profile, args) => {
+      launch: async (profile, args, launchOpts) => {
         const n = seen.launches.push([profile, args]) - 1;
-        return { code: opts.codes?.[n] ?? 0, since: n, sessionId: `s${n}`, moveAgreed: opts.agreed?.[n] };
+        seen.held.push(launchOpts?.holdAuto === true);
+        return { code: opts.codes?.[n] ?? 0, since: n, sessionId: `s${n}`, moveAgreed: opts.agreed?.[n], autoMoved: opts.auto?.[n] };
       },
       plan: async () => plans.shift() ?? null,
       ask: (question) => { seen.asked.push(question); return opts.answer ?? true; },
@@ -264,5 +325,53 @@ describe('runWithContinuation', () => {
     expect(await runWithContinuation('work', ['-p', 'hi'], false, deps)).toBe(0);
     expect(planned).toBe(0);
     expect(seen.launches).toHaveLength(1);
+  });
+});
+
+describe('runWithContinuation — moving on its own', () => {
+  const room = (profile: string) => ({ profile, status: { fiveHourPct: 10, weeklyPct: 20 } });
+
+  function scripted(plans: Array<ContinuationPlan | null>, auto: boolean[]) {
+    const seen = { launches: [] as Array<[string, string[]]>, held: [] as boolean[], asked: [] as string[], said: [] as string[] };
+    const deps: RunDeps = {
+      prepare: () => {},
+      launch: async (profile, args, launchOpts) => {
+        const n = seen.launches.push([profile, args]) - 1;
+        seen.held.push(launchOpts?.holdAuto === true);
+        return { code: 0, since: n, sessionId: `s${n}`, autoMoved: auto[n] };
+      },
+      plan: async () => plans.shift() ?? null,
+      ask: (question) => { seen.asked.push(question); return true; },
+      say: (line) => { seen.said.push(line); },
+    };
+    return { seen, deps };
+  }
+
+  it('moves without asking, saying how full the old window was', async () => {
+    const { seen, deps } = scripted([{ sessionId: 'abc', hit: { rateLimitType: 'seven_day' }, next: room('spare'), early: 95.6 }, null], [true]);
+    await runWithContinuation('work', ['--add-dir', 'x'], true, deps);
+
+    expect(seen.asked).toEqual([]);
+    expect(seen.said.join('\n')).toContain('work has used 96% of its weekly window. Continuing this session on spare (5h 10%, 7d 20%).');
+    expect(seen.launches).toEqual([['work', ['--add-dir', 'x']], ['spare', ['--add-dir', 'x', '--resume', 'abc']]]);
+    expect(seen.held).toEqual([false, false]);
+  });
+
+  it('resumes where it was, with auto held, when nowhere has more room', async () => {
+    const { seen, deps } = scripted([{ sessionId: 'abc', hit: { rateLimitType: 'five_hour' }, next: null, early: 96 }, null], [true, false]);
+    await runWithContinuation('work', [], true, deps);
+
+    expect(seen.said.join('\n')).toContain('no other claude subscription has more room, so it stays on work. Resuming it.');
+    expect(seen.launches).toEqual([['work', []], ['work', ['--resume', 'abc']]]);
+    expect(seen.held).toEqual([false, true]);
+  });
+
+  it('resumes where it was when a fresh reading has room again', async () => {
+    const { seen, deps } = scripted([null, null], [true, false]);
+    await runWithContinuation('work', [], true, deps);
+
+    expect(seen.said.join('\n')).toContain('work has room again, so it stays there. Resuming it.');
+    expect(seen.launches).toEqual([['work', []], ['work', ['--resume', 's0']]]);
+    expect(seen.held).toEqual([false, true]);
   });
 });

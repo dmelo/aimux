@@ -218,6 +218,16 @@ export function validateConfig(config: unknown): string[] {
     }
   }
 
+  if (c.continuation !== undefined) {
+    const k = c.continuation as Record<string, unknown> | null;
+    if (!k || typeof k !== 'object' || Array.isArray(k)) {
+      errors.push('continuation must be an object');
+    } else if (k.auto_at !== undefined
+        && (typeof k.auto_at !== 'number' || !Number.isFinite(k.auto_at) || k.auto_at < 1 || k.auto_at > 100)) {
+      errors.push('continuation.auto_at must be a number from 1 to 100');
+    }
+  }
+
   return errors;
 }
 

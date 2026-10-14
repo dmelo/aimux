@@ -158,6 +158,23 @@ describe('history', () => {
   });
 });
 
+describe('continuation config validation', () => {
+  it('accepts auto_at from 1 to 100, and no continuation at all', () => {
+    const config = createDefaultConfig('~/.claude');
+    expect(validateConfig(config)).toEqual([]);
+    for (const auto_at of [1, 95, 100]) expect(validateConfig({ ...config, continuation: { auto_at } })).toEqual([]);
+    expect(validateConfig({ ...config, continuation: {} })).toEqual([]);
+  });
+
+  it('rejects an auto_at out of range or not a number, and a continuation that is not an object', () => {
+    const config = createDefaultConfig('~/.claude');
+    for (const auto_at of [0, 101, '95', Number.NaN]) {
+      expect(validateConfig({ ...config, continuation: { auto_at } })).toEqual(['continuation.auto_at must be a number from 1 to 100']);
+    }
+    expect(validateConfig({ ...config, continuation: 95 })).toEqual(['continuation must be an object']);
+  });
+});
+
 describe('bindings config validation', () => {
   it('validates bindings array structure', () => {
     const config = createDefaultConfig('~/.claude');

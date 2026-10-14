@@ -20,10 +20,14 @@ const LIMITS = {
 const ran = (stdout: string, exitCode = 0) => ({ exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false });
 
 /** The engine's own answers beneath the plugins, for the events a test raises. */
-function engineBeneath(on: On) {
+function engineBeneath(on: On, commands: string[] = []) {
   on('session.start', (_$, e) => ({ cwd: e.cwd }));
   on('session.measure', (_$, e) => ({ changed: e.changed }));
-  on('command.run', () => ({ text: '' }));
+  on('turn.complete', (_$, e) => ({ text: e.answer }));
+  on('command.run', (_$, e) => {
+    commands.push(e.command);
+    return { text: '' };
+  });
   on('command.register', (_$, e) => ({ value: { command: e.name } }));
   on('classic.StopFailure', () => ({}));
 }
@@ -32,16 +36,26 @@ function engineBeneath(on: On) {
  * A session aimux launched as `dt`, with aimux answering `status --json` (or failing)
  * and the prompt box holding `draft`.
  */
-function launchedByAimux(on: On, answer = ran(JSON.stringify(LIMITS)), draft = '', windows: SessionRateLimit[] = []) {
-  engineBeneath(on);
+function launchedByAimux(
+  on: On,
+  answer = ran(JSON.stringify(LIMITS)),
+  draft = '',
+  windows: SessionRateLimit[] = [],
+  env: Record<string, string> = {},
+  agents: { status: string }[] = [],
+) {
   const seen = {
     toasts: [] as string[],
     runs: [] as (readonly string[])[],
     filled: [] as string[],
     written: [] as [string, string][],
+    commands: [] as string[],
+    agents,
   };
+  engineBeneath(on, seen.commands);
 
-  mock.env(on, { AIMUX_RUN_PROFILE: 'dt', AIMUX_SELF: '["node","/aimux/dist/cli.js"]', AIMUX_HANDOFF: '/aimux/handoff/1' });
+  mock.env(on, { AIMUX_RUN_PROFILE: 'dt', AIMUX_SELF: '["node","/aimux/dist/cli.js"]', AIMUX_HANDOFF: '/aimux/handoff/1', ...env });
+  on('agent.list', () => ({ value: seen.agents.map((a, i) => ({ id: `a${i}`, description: 'x', type: 'general-purpose', ...a })) as never }));
   on('process.run', (_$, e) => {
     seen.runs.push(e.argv);
     return { value: answer };
@@ -79,6 +93,7 @@ async function band($: Engine) {
 
 const START = { cwd: '/work', surface: 'terminal', isInteractive: true } as const;
 const EXIT = { command: 'exit', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 200 } } as const;
+const TURN_END = { answer: '', durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' } as const;
 const measure = (rateLimits: SessionRateLimit[]) => ({ context: { window: 1_000_000 }, rateLimits, changed: ['rateLimits' as const] });
 
 describe('aimux mod', () => {
@@ -339,5 +354,129 @@ describe('aimux mod', () => {
       drew = false;
     }
     expect(drew).toBe(false);
+  });
+});
+
+describe('aimux mod — moving on its own (continuation.auto_at)', () => {
+  const AUTO = { AIMUX_AUTO_AT: '95' };
+
+  test('at the line, says where it will go, and moves once the turn ends — never mid-turn', async ($, on) => {
+    const clock = mock.clock(on, { now: Date.parse('2026-10-04T15:50:00Z') });
+    const seen = launchedByAimux(on, undefined, '', [], AUTO);
+    await $.session.start(START);
+    await clock.settle();
+
+    await $.session.measure(measure([{ kind: 'five_hour', percentUsed: 95.4, resetsAt: '2026-10-04T18:00:00Z' }]));
+    await clock.settle();
+    expect(seen.toasts).toEqual([
+      'dt has used 95% of its 5-hour window (resets in 2h 10m). Moving this conversation to main (5h 13%, 7d 17%) once this turn ends.',
+    ]);
+    // Mid-turn: nothing written, nothing run.
+    expect(seen.written).toEqual([]);
+    expect(seen.commands).toEqual([]);
+
+    await $.turn.complete(TURN_END);
+    await clock.settle();
+    expect(seen.written).toEqual([['/aimux/handoff/1', JSON.stringify({ profile: 'main', auto: true })]]);
+    expect(seen.commands).toEqual(['exit']);
+    expect(seen.filled).toEqual([]);
+  });
+
+  test('below the line, it only warns as before', async ($, on) => {
+    const clock = mock.clock(on);
+    const seen = launchedByAimux(on, undefined, '', [], AUTO);
+    await $.session.start(START);
+    await clock.settle();
+
+    await $.session.measure(measure([{ kind: 'five_hour', percentUsed: 92, resetsAt: 'r1' }]));
+    await $.turn.complete(TURN_END);
+    await clock.settle();
+    expect(seen.toasts).toHaveLength(1);
+    expect(seen.toasts[0]).toContain('has used 92%');
+    expect(seen.commands).toEqual([]);
+  });
+
+  test('goes nowhere that is itself at the line, and says so once', async ($, on) => {
+    // main is fine on 5h but at 96% of its week: it would move again after one turn.
+    const clock = mock.clock(on);
+    const tight = { fetchedAt: 0, profiles: { main: { cli: 'claude', status: { fiveHourPct: 5, weeklyPct: 96 } } } };
+    const seen = launchedByAimux(on, ran(JSON.stringify(tight)), '', [], AUTO);
+    await $.session.start(START);
+    await clock.settle();
+
+    for (const percentUsed of [95, 97]) await $.session.measure(measure([{ kind: 'five_hour', percentUsed, resetsAt: 'r1' }]));
+    await $.turn.complete(TURN_END);
+    await clock.settle();
+    expect(seen.toasts).toEqual(['dt has used 95% of its 5-hour window. No other claude subscription is below 95%, so this one carries on.']);
+    expect(seen.commands).toEqual([]);
+    expect(seen.written).toEqual([]);
+  });
+
+  test('waits while a background agent runs, then moves at a later turn end', async ($, on) => {
+    const clock = mock.clock(on);
+    const seen = launchedByAimux(on, undefined, '', [], AUTO, [{ status: 'running' }]);
+    await $.session.start(START);
+    await clock.settle();
+
+    await $.session.measure(measure([{ kind: 'five_hour', percentUsed: 96, resetsAt: 'r1' }]));
+    await $.turn.complete(TURN_END);
+    await clock.settle();
+    expect(seen.commands).toEqual([]);
+    expect(seen.toasts.at(-1)).toBe('Waiting for 1 background agent to finish before moving to main.');
+
+    seen.agents.length = 0;
+    await $.turn.complete(TURN_END);
+    await clock.settle();
+    expect(seen.commands).toEqual(['exit']);
+  });
+
+  test('a subagent finishing its turn is not the conversation finishing one', async ($, on) => {
+    const clock = mock.clock(on);
+    const seen = launchedByAimux(on, undefined, '', [], AUTO);
+    await $.session.start(START);
+    await clock.settle();
+
+    await $.session.measure(measure([{ kind: 'five_hour', percentUsed: 96, resetsAt: 'r1' }]));
+    await $.turn.complete({ ...TURN_END, agentId: 'sub-1' });
+    await clock.settle();
+    expect(seen.commands).toEqual([]);
+  });
+
+  test('a window that eased back under the line cancels the move', async ($, on) => {
+    const clock = mock.clock(on);
+    const seen = launchedByAimux(on, undefined, '', [], AUTO);
+    await $.session.start(START);
+    await clock.settle();
+
+    await $.session.measure(measure([{ kind: 'five_hour', percentUsed: 96, resetsAt: 'r1' }]));
+    await $.session.measure(measure([{ kind: 'five_hour', percentUsed: 3, resetsAt: 'r2' }]));
+    await $.turn.complete(TURN_END);
+    await clock.settle();
+    expect(seen.commands).toEqual([]);
+  });
+
+  test('a turn refused over the limit moves straight away', async ($, on) => {
+    const clock = mock.clock(on);
+    const seen = launchedByAimux(on, undefined, '', [{ kind: 'five_hour', percentUsed: 99, resetsAt: 'r1' }], AUTO);
+    await $.session.start(START);
+    await clock.settle();
+
+    await $.classic.StopFailure({ error: 'rate_limit' });
+    await clock.settle();
+    expect(seen.written).toEqual([['/aimux/handoff/1', JSON.stringify({ profile: 'main', auto: true })]]);
+    expect(seen.commands).toEqual(['exit']);
+  });
+
+  test('without auto_at nothing moves on its own', async ($, on) => {
+    const clock = mock.clock(on);
+    const seen = launchedByAimux(on);
+    await $.session.start(START);
+    await clock.settle();
+
+    await $.session.measure(measure([{ kind: 'five_hour', percentUsed: 97, resetsAt: 'r1' }]));
+    await $.turn.complete(TURN_END);
+    await clock.settle();
+    expect(seen.commands).toEqual([]);
+    expect(seen.written).toEqual([]);
   });
 });
