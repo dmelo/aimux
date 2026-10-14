@@ -20,11 +20,13 @@ const LIMITS = {
 const ran = (stdout: string, exitCode = 0) => ({ exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false });
 
 /** The engine's own answers beneath the plugins, for the events a test raises. */
-function engineBeneath(on: On, commands: string[] = []) {
+function engineBeneath(on: On, commands: string[] = [], opts: { refuseExit?: boolean } = {}) {
   on('session.start', (_$, e) => ({ cwd: e.cwd }));
   on('session.measure', (_$, e) => ({ changed: e.changed }));
+  on('classic.Stop', () => ({}));
   on('turn.complete', (_$, e) => ({ text: e.answer }));
   on('command.run', (_$, e) => {
+    if (opts.refuseExit && e.command === 'exit') throw new Error('not from here');
     commands.push(e.command);
     return { text: '' };
   });
@@ -43,6 +45,7 @@ function launchedByAimux(
   windows: SessionRateLimit[] = [],
   env: Record<string, string> = {},
   agents: { status: string }[] = [],
+  opts: { refuseExit?: boolean } = {},
 ) {
   const seen = {
     toasts: [] as string[],
@@ -50,9 +53,15 @@ function launchedByAimux(
     filled: [] as string[],
     written: [] as [string, string][],
     commands: [] as string[],
+    submitted: [] as string[],
     agents,
+    draft,
   };
-  engineBeneath(on, seen.commands);
+  engineBeneath(on, seen.commands, opts);
+  on('prompt.submit', (_$, e) => {
+    seen.submitted.push(e.text);
+    return { text: e.text } as never;
+  });
 
   mock.env(on, { AIMUX_RUN_PROFILE: 'dt', AIMUX_SELF: '["node","/aimux/dist/cli.js"]', AIMUX_HANDOFF: '/aimux/handoff/1', ...env });
   on('agent.list', () => ({ value: seen.agents.map((a, i) => ({ id: `a${i}`, description: 'x', type: 'general-purpose', ...a })) as never }));
@@ -64,7 +73,7 @@ function launchedByAimux(
     seen.toasts.push(e.text);
     return { value: undefined };
   });
-  on('prompt.read', () => ({ value: { text: draft, cursor: draft.length } }));
+  on('prompt.read', () => ({ value: { text: seen.draft, cursor: seen.draft.length } }));
   on('prompt.fill', (_$, e) => {
     seen.filled.push(e.text);
     return { isFilled: true, text: e.text, cursor: e.text.length };
@@ -93,7 +102,12 @@ async function band($: Engine) {
 
 const START = { cwd: '/work', surface: 'terminal', isInteractive: true } as const;
 const EXIT = { command: 'exit', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: 200 } } as const;
-const TURN_END = { answer: '', durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' } as const;
+/** The conversation's turn ended with an answer, leaving `tasks` background tasks and `crons` wakeups. */
+const stop = (tasks = 0, crons = 0) => ({
+  stop_hook_active: false,
+  background_tasks: Array.from({ length: tasks }, (_, i) => ({ id: `t${i}`, type: 'shell', status: 'running', description: 'dev server' })),
+  session_crons: Array.from({ length: crons }, (_, i) => ({ id: `c${i}` })),
+}) as never;
 const measure = (rateLimits: SessionRateLimit[]) => ({ context: { window: 1_000_000 }, rateLimits, changed: ['rateLimits' as const] });
 
 describe('aimux mod', () => {
@@ -359,124 +373,216 @@ describe('aimux mod', () => {
 
 describe('aimux mod — moving on its own (continuation.auto_at)', () => {
   const AUTO = { AIMUX_AUTO_AT: '95' };
+  const handoffFor = (profile: string, window: object) => JSON.stringify({ profile, auto: true, window });
 
-  test('at the line, says where it will go, and moves once the turn ends — never mid-turn', async ($, on) => {
+  type Setup = {
+    answer?: ReturnType<typeof ran>; draft?: string; windows?: SessionRateLimit[]; env?: Record<string, string>;
+    agents?: { status: string }[]; refuseExit?: boolean;
+  };
+
+  /** A session aimux launched with auto_at 95, past its first reading of the others. */
+  async function started($: Engine, on: On, args: Setup = {}) {
     const clock = mock.clock(on, { now: Date.parse('2026-10-04T15:50:00Z') });
-    const seen = launchedByAimux(on, undefined, '', [], AUTO);
+    const seen = launchedByAimux(on, args.answer, args.draft, args.windows, { ...AUTO, ...args.env }, args.agents, { refuseExit: args.refuseExit });
     await $.session.start(START);
     await clock.settle();
+    return { clock, seen };
+  }
 
-    await $.session.measure(measure([{ kind: 'five_hour', percentUsed: 95.4, resetsAt: '2026-10-04T18:00:00Z' }]));
+  test('at the line, says where it will go, and moves when the turn ends — never mid-turn', async ($, on) => {
+    const { clock, seen } = await started($, on);
+    const window = { kind: 'five_hour', percentUsed: 95.4, resetsAt: '2026-10-04T18:00:00Z' } as const;
+
+    await $.session.measure(measure([window]));
     await clock.settle();
     expect(seen.toasts).toEqual([
       'dt has used 95% of its 5-hour window (resets in 2h 10m). Moving this conversation to main (5h 13%, 7d 17%) once this turn ends.',
     ]);
-    // Mid-turn: nothing written, nothing run.
     expect(seen.written).toEqual([]);
     expect(seen.commands).toEqual([]);
 
-    await $.turn.complete(TURN_END);
+    await $.classic.Stop(stop());
     await clock.settle();
-    expect(seen.written).toEqual([['/aimux/handoff/1', JSON.stringify({ profile: 'main', auto: true })]]);
+    // Where, and the window as the session read it: aimux trusts that figure.
+    expect(seen.written).toEqual([['/aimux/handoff/1', handoffFor('main', window)]]);
     expect(seen.commands).toEqual(['exit']);
     expect(seen.filled).toEqual([]);
   });
 
-  test('below the line, it only warns as before', async ($, on) => {
-    const clock = mock.clock(on);
-    const seen = launchedByAimux(on, undefined, '', [], AUTO);
-    await $.session.start(START);
-    await clock.settle();
+  test('below the line, it only warns — saying it will move rather than offer', async ($, on) => {
+    const { clock, seen } = await started($, on);
 
     await $.session.measure(measure([{ kind: 'five_hour', percentUsed: 92, resetsAt: 'r1' }]));
-    await $.turn.complete(TURN_END);
+    await $.classic.Stop(stop());
     await clock.settle();
-    expect(seen.toasts).toHaveLength(1);
-    expect(seen.toasts[0]).toContain('has used 92%');
+    expect(seen.toasts).toEqual([
+      'dt has used 92% of its 5-hour window. Freest now: main (5h 13%, 7d 17%). At 95%, aimux will move this conversation to whichever has the most room.',
+    ]);
     expect(seen.commands).toEqual([]);
   });
 
-  test('goes nowhere that is itself at the line, and says so once', async ($, on) => {
+  test('goes nowhere that is itself at the line, and says so once for both windows', async ($, on) => {
     // main is fine on 5h but at 96% of its week: it would move again after one turn.
-    const clock = mock.clock(on);
     const tight = { fetchedAt: 0, profiles: { main: { cli: 'claude', status: { fiveHourPct: 5, weeklyPct: 96 } } } };
-    const seen = launchedByAimux(on, ran(JSON.stringify(tight)), '', [], AUTO);
-    await $.session.start(START);
-    await clock.settle();
+    const { clock, seen } = await started($, on, { answer: ran(JSON.stringify(tight)) });
 
-    for (const percentUsed of [95, 97]) await $.session.measure(measure([{ kind: 'five_hour', percentUsed, resetsAt: 'r1' }]));
-    await $.turn.complete(TURN_END);
+    await $.session.measure(measure([{ kind: 'five_hour', percentUsed: 95, resetsAt: 'r1' }, { kind: 'seven_day', percentUsed: 97, resetsAt: 'r2' }]));
+    await $.session.measure(measure([{ kind: 'five_hour', percentUsed: 96, resetsAt: 'r1' }, { kind: 'seven_day', percentUsed: 97, resetsAt: 'r2' }]));
+    await $.classic.Stop(stop());
     await clock.settle();
     expect(seen.toasts).toEqual(['dt has used 95% of its 5-hour window. No other claude subscription is below 95%, so this one carries on.']);
     expect(seen.commands).toEqual([]);
     expect(seen.written).toEqual([]);
   });
 
-  test('waits while a background agent runs, then moves at a later turn end', async ($, on) => {
-    const clock = mock.clock(on);
-    const seen = launchedByAimux(on, undefined, '', [], AUTO, [{ status: 'running' }]);
-    await $.session.start(START);
-    await clock.settle();
+  test('says so honestly when aimux could not read the others', async ($, on) => {
+    const { clock, seen } = await started($, on, { answer: ran('', 1) });
 
     await $.session.measure(measure([{ kind: 'five_hour', percentUsed: 96, resetsAt: 'r1' }]));
-    await $.turn.complete(TURN_END);
+    await $.classic.Stop(stop());
     await clock.settle();
-    expect(seen.commands).toEqual([]);
-    expect(seen.toasts.at(-1)).toBe('Waiting for 1 background agent to finish before moving to main.');
-
-    seen.agents.length = 0;
-    await $.turn.complete(TURN_END);
-    await clock.settle();
-    expect(seen.commands).toEqual(['exit']);
-  });
-
-  test('a subagent finishing its turn is not the conversation finishing one', async ($, on) => {
-    const clock = mock.clock(on);
-    const seen = launchedByAimux(on, undefined, '', [], AUTO);
-    await $.session.start(START);
-    await clock.settle();
-
-    await $.session.measure(measure([{ kind: 'five_hour', percentUsed: 96, resetsAt: 'r1' }]));
-    await $.turn.complete({ ...TURN_END, agentId: 'sub-1' });
-    await clock.settle();
+    expect(seen.toasts).toEqual(['dt has used 96% of its 5-hour window. aimux could not read the other subscriptions, so this one carries on.']);
     expect(seen.commands).toEqual([]);
   });
+
+  for (const [what, args, stopped, toast] of [
+    ['a background task', {}, stop(1), 'Not moving to main while 1 background task would stop with this session; trying again when a turn ends.'],
+    ['a scheduled wakeup', {}, stop(0, 2), 'Not moving to main while 2 scheduled wakeups would stop with this session; trying again when a turn ends.'],
+    ['a subagent waiting on its own work', { agents: [{ status: 'waiting' }] }, stop(), 'Not moving to main while 1 agent would stop with this session; trying again when a turn ends.'],
+    ['a draft in the prompt', { draft: 'and then' }, stop(), 'Not moving to main over what you are typing; trying again when the next turn ends.'],
+  ] as const) {
+    test(`waits while ${what} would be lost, then moves at a later turn end`, async ($, on) => {
+      const { clock, seen } = await started($, on, args as Setup);
+
+      await $.session.measure(measure([{ kind: 'five_hour', percentUsed: 96, resetsAt: 'r1' }]));
+      await $.classic.Stop(stopped);
+      await clock.settle();
+      expect(seen.commands).toEqual([]);
+      expect(seen.written).toEqual([]);
+      expect(seen.toasts.at(-1)).toBe(toast);
+
+      // Nothing in the way any more.
+      seen.agents.length = 0;
+      seen.draft = '';
+      await $.classic.Stop(stop());
+      await clock.settle();
+      expect(seen.commands).toEqual(['exit']);
+    });
+  }
 
   test('a window that eased back under the line cancels the move', async ($, on) => {
-    const clock = mock.clock(on);
-    const seen = launchedByAimux(on, undefined, '', [], AUTO);
-    await $.session.start(START);
-    await clock.settle();
+    const { clock, seen } = await started($, on);
 
     await $.session.measure(measure([{ kind: 'five_hour', percentUsed: 96, resetsAt: 'r1' }]));
     await $.session.measure(measure([{ kind: 'five_hour', percentUsed: 3, resetsAt: 'r2' }]));
-    await $.turn.complete(TURN_END);
+    await $.classic.Stop(stop());
     await clock.settle();
     expect(seen.commands).toEqual([]);
   });
 
-  test('a turn refused over the limit moves straight away', async ($, on) => {
-    const clock = mock.clock(on);
-    const seen = launchedByAimux(on, undefined, '', [{ kind: 'five_hour', percentUsed: 99, resetsAt: 'r1' }], AUTO);
-    await $.session.start(START);
-    await clock.settle();
+  test('an interrupted turn is not the moment: the person is there, about to type', async ($, on) => {
+    const { clock, seen } = await started($, on);
+    const turn = { answer: '', durationMs: 1, turnId: 't1' };
 
-    await $.classic.StopFailure({ error: 'rate_limit' });
+    await $.session.measure(measure([{ kind: 'five_hour', percentUsed: 96, resetsAt: 'r1' }]));
+    await $.turn.complete({ ...turn, isAborted: true, reason: 'aborted' });
+    await $.classic.Stop(stop());
     await clock.settle();
-    expect(seen.written).toEqual([['/aimux/handoff/1', JSON.stringify({ profile: 'main', auto: true })]]);
+    expect(seen.commands).toEqual([]);
+
+    await $.turn.complete({ ...turn, isAborted: false, reason: 'answer' });
+    await $.classic.Stop(stop());
+    await clock.settle();
     expect(seen.commands).toEqual(['exit']);
   });
 
-  test('without auto_at nothing moves on its own', async ($, on) => {
+  test('two turn ends in a row make one move', async ($, on) => {
+    const { clock, seen } = await started($, on);
+
+    await $.session.measure(measure([{ kind: 'five_hour', percentUsed: 96, resetsAt: 'r1' }]));
+    await $.classic.Stop(stop());
+    await $.classic.Stop(stop());
+    await clock.settle();
+    expect(seen.written).toHaveLength(1);
+    expect(seen.commands).toEqual(['exit']);
+  });
+
+  test('an exit the engine will not run empties the handoff and offers the move instead', async ($, on) => {
+    const { clock, seen } = await started($, on, { refuseExit: true });
+
+    await $.session.measure(measure([{ kind: 'five_hour', percentUsed: 96, resetsAt: 'r1' }]));
+    await $.classic.Stop(stop());
+    await clock.settle();
+    expect(seen.written.map(([, text]) => text).at(-1)).toBe('');
+    expect(seen.filled).toEqual(['/exit']);
+    expect(seen.toasts.at(-1)).toBe('Press Enter to move this conversation to main.');
+  });
+
+  test('never moves again on a window aimux already found nowhere to move it on', async ($, on) => {
+    const { clock, seen } = await started($, on, { env: { AIMUX_AUTO_HOLD: 'five_hour:r1' } });
+
+    await $.session.measure(measure([{ kind: 'five_hour', percentUsed: 97, resetsAt: 'r1' }]));
+    await $.classic.Stop(stop());
+    await clock.settle();
+    expect(seen.commands).toEqual([]);
+
+    // The weekly window crossing the line is a new window: that one moves.
+    await $.session.measure(measure([{ kind: 'five_hour', percentUsed: 97, resetsAt: 'r1' }, { kind: 'seven_day', percentUsed: 95, resetsAt: 'w1' }]));
+    await $.classic.Stop(stop());
+    await clock.settle();
+    expect(seen.commands).toEqual(['exit']);
+  });
+
+  test('a window spent on a response moves anywhere with room, at the turn end', async ($, on) => {
+    // main is past the line on its week, but has room: a spent window takes it.
+    const tight = { fetchedAt: 0, profiles: { main: { cli: 'claude', status: { fiveHourPct: 5, weeklyPct: 97 } } } };
+    const { clock, seen } = await started($, on, { answer: ran(JSON.stringify(tight)) });
+
+    await $.session.measure(measure([{ kind: 'five_hour', percentUsed: 100, resetsAt: 'r1' }]));
+    await clock.settle();
+    expect(seen.commands).toEqual([]);
+    await $.classic.Stop(stop());
+    await clock.settle();
+    expect(seen.commands).toEqual(['exit']);
+  });
+
+  test('a turn refused over the limit moves straight away', async ($, on) => {
+    const { clock, seen } = await started($, on, { windows: [{ kind: 'five_hour', percentUsed: 99, resetsAt: 'r1' }] });
+
+    await $.classic.StopFailure({ error: 'rate_limit' });
+    await clock.settle();
+    expect(seen.written).toEqual([['/aimux/handoff/1', handoffFor('main', { kind: 'five_hour', percentUsed: 99, resetsAt: 'r1' })]]);
+    expect(seen.commands).toEqual(['exit']);
+  });
+
+  test('a refused turn with background work left running offers the move instead', async ($, on) => {
+    const { clock, seen } = await started($, on, { windows: [{ kind: 'five_hour', percentUsed: 99, resetsAt: 'r1' }] });
+    await $.classic.Stop(stop(1));
+
+    await $.classic.StopFailure({ error: 'rate_limit' });
+    await clock.settle();
+    expect(seen.commands).toEqual([]);
+    expect(seen.filled).toEqual(['/exit']);
+  });
+
+  test('sends the resume prompt aimux set, once, as the person', async ($, on) => {
+    const { clock, seen } = await started($, on, { env: { AIMUX_RESUME_PROMPT: 'Continue where you left off.' } });
+    await $.session.start(START);
+    await clock.settle();
+    expect(seen.submitted).toEqual(['Continue where you left off.']);
+  });
+
+  test('without auto_at nothing moves on its own, and nothing is sent', async ($, on) => {
     const clock = mock.clock(on);
-    const seen = launchedByAimux(on);
+    const seen = launchedByAimux(on, undefined, '', [], { AIMUX_AUTO_AT: '', AIMUX_RESUME_PROMPT: '' });
     await $.session.start(START);
     await clock.settle();
 
     await $.session.measure(measure([{ kind: 'five_hour', percentUsed: 97, resetsAt: 'r1' }]));
-    await $.turn.complete(TURN_END);
+    await $.classic.Stop(stop());
     await clock.settle();
     expect(seen.commands).toEqual([]);
     expect(seen.written).toEqual([]);
+    expect(seen.submitted).toEqual([]);
   });
 });

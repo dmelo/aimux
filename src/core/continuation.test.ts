@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import type { AimuxConfig } from '../types/index.js';
 import type { RateLimitProbe } from './limits.js';
-import { continuationArgs, planContinuation, runWithContinuation, sessionIdFromArgs, type ContinuationPlan, type RunDeps } from './continuation.js';
+import { continuationArgs, DEFAULT_RESUME_PROMPT, planContinuation, runWithContinuation, sessionIdFromArgs, type ContinuationPlan, type LaunchOptions, type RunDeps } from './continuation.js';
 import { resetAimuxDir, setAimuxDir } from './paths.js';
 
 let root: string;
@@ -104,31 +104,41 @@ describe('planContinuation — moving early (continuation.auto_at)', () => {
   const ordinaryEnd = { type: 'assistant', message: { model: 'claude-opus-5-5', role: 'assistant', content: [] } };
   const byProfile = (figures: Record<string, RateLimitProbe>) =>
     async (_p: unknown, path: string) => figures[path.split('/').at(-1) ?? ''] ?? status(0, 0);
+  const AT_96 = { kind: 'five_hour', percentUsed: 96, resetsAt: new Date(FAR_FUTURE * 1000).toISOString() };
 
   it('moves a session with no spent window once the mod ended it at the line', async () => {
     sessionEndingWith(ordinaryEnd);
     const probe = byProfile({ work: status(96, 40), spare: status(10, 20), busy: status(50, 97), claude: status(60, 60) });
 
-    const plan = await planContinuation(config(), 'work', { since: 0 }, probe, Date.now(), { autoAt: 95 });
+    const plan = await planContinuation(config(), 'work', { since: 0 }, probe, Date.now(), { autoAt: 95, window: AT_96 });
 
     expect(plan?.sessionId).toBe('sess-1');
     expect(plan?.early).toBe(96);
-    expect(plan?.hit.rateLimitType).toBe('five_hour');
+    expect(plan?.hit).toEqual({ rateLimitType: 'five_hour', resetsAt: FAR_FUTURE * 1000 });
     // busy has the emptiest 5-hour window but sits past the line on its week.
     expect(plan?.next?.profile).toBe('spare');
+  });
+
+  it('trusts the figure the session read, so a probe of this subscription that fails or disagrees changes nothing', async () => {
+    sessionEndingWith(ordinaryEnd);
+    for (const own of [{ status: null, error: 'unavailable' } as RateLimitProbe, status(90, 10)]) {
+      const plan = await planContinuation(config(), 'work', { since: 0 }, byProfile({ work: own, spare: status(10, 20), busy: status(50, 97), claude: status(60, 60) }), Date.now(), { autoAt: 95, window: AT_96 });
+      expect(plan?.next?.profile).toBe('spare');
+    }
   });
 
   it('offers nowhere that is itself at the line', async () => {
     sessionEndingWith(ordinaryEnd);
     const probe = byProfile({ work: status(96, 40), spare: status(95, 1), busy: status(1, 99), claude: status(100, 0) });
-    const plan = await planContinuation(config(), 'work', { since: 0 }, probe, Date.now(), { autoAt: 95 });
+    const plan = await planContinuation(config(), 'work', { since: 0 }, probe, Date.now(), { autoAt: 95, window: AT_96 });
     expect(plan?.next).toBeNull();
+    expect(plan?.early).toBe(96);
   });
 
-  it('stays when a fresh reading has this subscription back under the line', async () => {
+  it('stays when the window the mod read has reset since', async () => {
     sessionEndingWith(ordinaryEnd);
-    const probe = byProfile({ work: status(4, 40), spare: status(10, 20) });
-    expect(await planContinuation(config(), 'work', { since: 0 }, probe, Date.now(), { autoAt: 95 })).toBeNull();
+    const reset = { ...AT_96, resetsAt: new Date(1_000_000).toISOString() };
+    expect(await planContinuation(config(), 'work', { since: 0 }, byProfile({ spare: status(10, 20) }), Date.now(), { autoAt: 95, window: reset })).toBeNull();
   });
 
   it('still moves nothing early unless the mod asked for it', async () => {
@@ -142,10 +152,10 @@ describe('planContinuation — moving early (continuation.auto_at)', () => {
   it('leaves the reading every session shares fresh', async () => {
     sessionEndingWith(ordinaryEnd);
     const now = Date.now();
-    await planContinuation(config(), 'work', { since: 0 }, byProfile({ work: status(96, 1) }), now, { autoAt: 95 });
+    await planContinuation(config(), 'work', { since: 0 }, byProfile({ spare: status(12, 3) }), now, { autoAt: 95, window: AT_96 });
     const cached = JSON.parse(readFileSync(join(root, 'aimux', 'limits-cache.json'), 'utf-8'));
     expect(cached.fetchedAt).toBe(now);
-    expect(cached.profiles.work.status.fiveHourPct).toBe(96);
+    expect(cached.profiles.spare.status.fiveHourPct).toBe(12);
   });
 });
 
@@ -243,7 +253,7 @@ describe('runWithContinuation', () => {
       prepare: (profile) => { seen.prepared.push(profile); },
       launch: async (profile, args, launchOpts) => {
         const n = seen.launches.push([profile, args]) - 1;
-        seen.held.push(launchOpts?.holdAuto === true);
+        seen.held.push(launchOpts?.holdWindow !== undefined);
         return { code: opts.codes?.[n] ?? 0, since: n, sessionId: `s${n}`, moveAgreed: opts.agreed?.[n], autoMoved: opts.auto?.[n] };
       },
       plan: async () => plans.shift() ?? null,
@@ -330,19 +340,23 @@ describe('runWithContinuation', () => {
 
 describe('runWithContinuation — moving on its own', () => {
   const room = (profile: string) => ({ profile, status: { fiveHourPct: 10, weeklyPct: 20 } });
+  const WINDOW = { kind: 'five_hour', percentUsed: 96, resetsAt: '2026-10-04T18:00:00Z' };
 
-  function scripted(plans: Array<ContinuationPlan | null>, auto: boolean[]) {
-    const seen = { launches: [] as Array<[string, string[]]>, held: [] as boolean[], asked: [] as string[], said: [] as string[] };
+  function scripted(plans: Array<ContinuationPlan | null>, auto: boolean[], resumePrompt?: string | false) {
+    const seen = {
+      launches: [] as Array<[string, string[]]>, opts: [] as Array<LaunchOptions | undefined>, asked: [] as string[], said: [] as string[],
+    };
     const deps: RunDeps = {
       prepare: () => {},
       launch: async (profile, args, launchOpts) => {
         const n = seen.launches.push([profile, args]) - 1;
-        seen.held.push(launchOpts?.holdAuto === true);
-        return { code: 0, since: n, sessionId: `s${n}`, autoMoved: auto[n] };
+        seen.opts.push(launchOpts);
+        return { code: 0, since: n, sessionId: `s${n}`, autoMoved: auto[n], autoWindow: auto[n] ? WINDOW : undefined };
       },
       plan: async () => plans.shift() ?? null,
       ask: (question) => { seen.asked.push(question); return true; },
       say: (line) => { seen.said.push(line); },
+      resumePrompt,
     };
     return { seen, deps };
   }
@@ -354,25 +368,33 @@ describe('runWithContinuation — moving on its own', () => {
     expect(seen.asked).toEqual([]);
     expect(seen.said.join('\n')).toContain('work has used 96% of its weekly window. Continuing this session on spare (5h 10%, 7d 20%).');
     expect(seen.launches).toEqual([['work', ['--add-dir', 'x']], ['spare', ['--add-dir', 'x', '--resume', 'abc']]]);
-    expect(seen.held).toEqual([false, false]);
+    // Between turns: nothing cut short, so nothing to send.
+    expect(seen.opts[1]).toBeUndefined();
   });
 
-  it('resumes where it was, with auto held, when nowhere has more room', async () => {
+  it('resumes where it was, holding only that window, when nowhere is below the line', async () => {
     const { seen, deps } = scripted([{ sessionId: 'abc', hit: { rateLimitType: 'five_hour' }, next: null, early: 96 }, null], [true, false]);
     await runWithContinuation('work', [], true, deps);
 
     expect(seen.said.join('\n')).toContain('no other claude subscription has more room, so it stays on work. Resuming it.');
     expect(seen.launches).toEqual([['work', []], ['work', ['--resume', 'abc']]]);
-    expect(seen.held).toEqual([false, true]);
+    expect(seen.opts[1]).toEqual({ holdWindow: 'five_hour:2026-10-04T18:00:00Z' });
   });
 
-  it('resumes where it was when a fresh reading has room again', async () => {
+  it('resumes where it was when the window reset meanwhile', async () => {
     const { seen, deps } = scripted([null, null], [true, false]);
     await runWithContinuation('work', [], true, deps);
 
     expect(seen.said.join('\n')).toContain('work has room again, so it stays there. Resuming it.');
     expect(seen.launches).toEqual([['work', []], ['work', ['--resume', 's0']]]);
-    expect(seen.held).toEqual([false, true]);
+  });
+
+  it('a spent window with nowhere to go ends as it always did, with its reset time', async () => {
+    const { seen, deps } = scripted([{ sessionId: 'abc', hit: { rateLimitType: 'five_hour', resetsAt: FAR_FUTURE * 1000 }, next: null }], [true]);
+    await runWithContinuation('work', [], true, deps);
+
+    expect(seen.launches).toHaveLength(1);
+    expect(seen.said.join('\n')).toMatch(/work hit its 5-hour limit \(resets .+\), and no other claude subscription has room right now/);
   });
 });
 
@@ -380,46 +402,43 @@ describe('runWithContinuation — picking the work up again', () => {
   const room = (profile: string) => ({ profile, status: { fiveHourPct: 10, weeklyPct: 20 } });
   const HIT: ContinuationPlan['hit'] = { rateLimitType: 'five_hour' };
 
-  function scripted(plans: Array<ContinuationPlan | null>, run: { agreed?: string; auto?: boolean } = {}) {
+  /** One move after a spent window, agreed as `run` says; the options the move launched with. */
+  async function movedWith(run: { agreed?: string; auto?: boolean }, resumePrompt?: string | false, early?: number) {
+    const opts: Array<LaunchOptions | undefined> = [];
     const launches: Array<[string, string[]]> = [];
     const deps: RunDeps = {
       prepare: () => {},
-      launch: async (profile, args) => {
+      launch: async (profile, args, launchOpts) => {
         const n = launches.push([profile, args]) - 1;
+        opts.push(launchOpts);
         return { code: 0, since: n, sessionId: `s${n}`, moveAgreed: n === 0 ? run.agreed : undefined, autoMoved: n === 0 && run.auto };
       },
-      plan: async () => plans.shift() ?? null,
+      plan: (() => { let first = true; return async () => (first ? (first = false, { sessionId: 'abc', hit: HIT, next: room('spare'), early }) : null); })(),
       ask: () => true,
       say: () => {},
-      resumePrompt: 'Continue where you left off.',
+      resumePrompt,
     };
-    return { launches, deps };
+    await runWithContinuation('work', ['--add-dir', 'x', 'fix the bug'], true, deps);
+    // The prompt never rides in the args: they stay exactly what a move always launched.
+    expect(launches[1]).toEqual(['spare', ['--add-dir', 'x', 'fix the bug', '--resume', 'abc']]);
+    return opts[1]?.resumePrompt;
   }
 
-  it('tells a session whose turn the spent window cut short to carry on, however the move was agreed', async () => {
-    for (const run of [{}, { agreed: 'spare' }, { auto: true }]) {
-      const { launches, deps } = scripted([{ sessionId: 'abc', hit: HIT, next: room('spare') }, null], run);
-      await runWithContinuation('work', ['--add-dir', 'x'], true, deps);
-      expect(launches[1]).toEqual(['spare', ['--add-dir', 'x', '--resume', 'abc', 'Continue where you left off.']]);
-    }
+  it('by default, tells only a session moved on its own to carry on', async () => {
+    expect(await movedWith({ auto: true })).toBe(DEFAULT_RESUME_PROMPT);
+    expect(await movedWith({})).toBeUndefined();
+    expect(await movedWith({ agreed: 'spare' })).toBeUndefined();
+  });
+
+  it('with resume_prompt set, tells every session moved after a spent window', async () => {
+    for (const run of [{}, { agreed: 'spare' }, { auto: true }]) expect(await movedWith(run, 'carry on')).toBe('carry on');
+  });
+
+  it('with resume_prompt false, tells none', async () => {
+    expect(await movedWith({ auto: true }, false)).toBeUndefined();
   });
 
   it('sends nothing after an early move: that one happened between turns', async () => {
-    const { launches, deps } = scripted([{ sessionId: 'abc', hit: HIT, next: room('spare'), early: 96 }, null], { auto: true });
-    await runWithContinuation('work', [], true, deps);
-    expect(launches[1]).toEqual(['spare', ['--resume', 'abc']]);
-  });
-
-  it('sends nothing when the session resumes where it was', async () => {
-    const { launches, deps } = scripted([{ sessionId: 'abc', hit: HIT, next: null, early: 96 }, null], { auto: true });
-    await runWithContinuation('work', [], true, deps);
-    expect(launches[1]).toEqual(['work', ['--resume', 'abc']]);
-  });
-
-  it('sends nothing when no prompt is configured', async () => {
-    const { launches, deps } = scripted([{ sessionId: 'abc', hit: HIT, next: room('spare') }, null]);
-    deps.resumePrompt = undefined;
-    await runWithContinuation('work', [], true, deps);
-    expect(launches[1]).toEqual(['spare', ['--resume', 'abc']]);
+    expect(await movedWith({ auto: true }, 'carry on', 96)).toBeUndefined();
   });
 });

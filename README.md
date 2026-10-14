@@ -159,6 +159,42 @@ aimux reads the hit from the session's own transcript, so an ordinary exit costs
 nothing; the other subscriptions are only checked when a limit was actually reached. It
 works inside `aimux split` panes too.
 
+#### Moving on its own, before the window runs out
+
+Set `continuation.auto_at` and nobody is asked:
+
+```yaml
+# ~/.aimux/config.yaml
+continuation:
+  auto_at: 95            # move once a window reaches 95%
+```
+
+Once a window of the session's subscription reaches that percentage, the move happens
+when the turn under way ends — only to a subscription below the line on both windows,
+since anywhere fuller would move it again after one turn. It never happens mid-turn,
+after you interrupt with Esc, over something you are typing, or while background work
+(a background shell, a monitor, a waiting subagent, a `/loop`) or a scheduled wakeup
+would stop with the process; it waits for a later turn's end instead. With nowhere
+below the line, the session stays and says so. A turn refused because the window is
+spent moves to any subscription with room, as the question would.
+
+```
+⚠ work has used 96% of its 5-hour window (resets 23:10). Continuing this session on personal (5h 10%, 7d 16%).
+```
+
+A session moved because its window ran out had its turn cut short, so it is resumed
+with a first message — "Continue where you left off." — and the work picks up again.
+By default that happens after an automatic move only: someone who answered the question
+is there to say what comes next. `resume_prompt` changes it:
+
+```yaml
+continuation:
+  resume_prompt: "Carry on with what you were doing."   # after every move a spent window caused
+  # resume_prompt: false                                # never
+```
+
+A move at `auto_at` sends nothing: it happens between turns, after an answer.
+
 ### Every subscription's usage inside Claude Code
 
 A claude session started with `aimux run` — or in an `aimux split` pane — shows every
@@ -426,6 +462,12 @@ profiles:
     # Optional non-secret env injected into the spawned CLI (overrides .env).
     # env:
     #   ANTHROPIC_DEFAULT_OPUS_MODEL: claude-opus-5-5
+
+# Optional: move a session to another subscription on its own, and what to tell it
+# (see "Moving on its own, before the window runs out").
+# continuation:
+#   auto_at: 95
+#   resume_prompt: false
 
 private:
   - .credentials.json

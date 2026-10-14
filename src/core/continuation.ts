@@ -7,6 +7,15 @@ import {
 } from './limits.js';
 import { findTranscript, sessionQuotaHit, sessionTouchedSince, type QuotaHit } from './sessionMarkers.js';
 
+/** The window that made the mod move a session on its own, as the session itself last
+ *  read it: claude's window name, how much of it was used, and its reset time as the
+ *  engine reported it (an ISO string — the mod's key for that window). */
+export interface AutoWindow {
+  kind: string;
+  percentUsed: number;
+  resetsAt?: string;
+}
+
 export interface ContinuationPlan {
   sessionId: string;
   hit: QuotaHit;
@@ -36,8 +45,9 @@ export async function planContinuation(
   probe: (profile: ProfileConfig, profilePath: string) => Promise<RateLimitProbe> = fetchRateLimits,
   now: number = Date.now(),
   /** `autoAt`: the mod ended the session on its own as a window crossed this percentage
-   *  (`continuation.auto_at`), so a session with no spent window may still move. */
-  options: { autoAt?: number } = {},
+   *  (`continuation.auto_at`), so a session with no spent window may still move;
+   *  `window`: the reading it did that on. */
+  options: { autoAt?: number; window?: AutoWindow } = {},
 ): Promise<ContinuationPlan | null> {
   const profile = getProfile(config, profileName);
   if ((profile.cli ?? 'claude') !== 'claude') return null;
@@ -54,7 +64,11 @@ export async function planContinuation(
     ? recorded
     : null;
   if (!sessionId) return null;
-  if (!hit) return options.autoAt === undefined ? null : planEarly(config, profileName, sessionId, options.autoAt, probe, now);
+  if (!hit) {
+    return options.autoAt === undefined
+      ? null
+      : planEarly(config, profileName, sessionId, options.autoAt, options.window, probe, now);
+  }
 
   const others = rateLimitProfiles(config.profiles)
     .filter((name) => name !== profileName && (config.profiles[name].cli ?? 'claude') === 'claude');
@@ -70,10 +84,12 @@ export async function planContinuation(
 }
 
 /**
- * Moving before the window is spent: read every subscription fresh — which also
- * refreshes the reading every open session shares, so a mod that just ended this one
- * on an older figure sees the new one — and move only if this subscription is still at
- * `autoAt` or past it, and only to one whose every window is below it. Anywhere fuller
+ * Moving before the window is spent. This subscription's own figure is the one the
+ * session read live when the mod ended it — trusted as it stands, so a probe that fails
+ * or rounds differently cannot keep a session the mod already ended from moving. Only
+ * the destinations are read fresh, which also refreshes the reading every open session
+ * shares: a mod that chose on an older figure sees the new one when the session resumes.
+ * Only a subscription whose every window is below `autoAt` qualifies — anywhere fuller
  * would end its session the same way after one turn.
  */
 async function planEarly(
@@ -81,19 +97,15 @@ async function planEarly(
   profileName: string,
   sessionId: string,
   autoAt: number,
+  window: AutoWindow | undefined,
   probe: (profile: ProfileConfig, profilePath: string) => Promise<RateLimitProbe>,
   now: number,
 ): Promise<ContinuationPlan | null> {
   const { profiles } = await limitsSnapshot(config, 0, now, probe);
 
-  const own = profiles[profileName]?.status;
-  const windows = [
-    { rateLimitType: 'five_hour', pct: own?.fiveHourPct, resetsAt: own?.fiveHourResetsAt },
-    { rateLimitType: 'seven_day', pct: own?.weeklyPct, resetsAt: own?.weeklyResetsAt },
-  ].filter((w): w is { rateLimitType: string; pct: number; resetsAt: number | undefined } => typeof w.pct === 'number');
-  const tightest = windows.sort((a, b) => b.pct - a.pct)[0];
-  // Eased back under the line (a window reset since), or no figures: stay.
-  if (!tightest || tightest.pct < autoAt) return null;
+  const resetsAt = window?.resetsAt ? Date.parse(window.resetsAt) : undefined;
+  // The window reset between the mod's reading and now: this subscription has room again.
+  if (resetsAt !== undefined && Number.isFinite(resetsAt) && resetsAt <= now) return null;
 
   const below = new Map(Object.entries(profiles)
     .filter(([name, p]) => name !== profileName && p.cli === 'claude' && p.status
@@ -103,9 +115,9 @@ async function planEarly(
 
   return {
     sessionId,
-    hit: { rateLimitType: tightest.rateLimitType, resetsAt: tightest.resetsAt },
+    hit: { rateLimitType: window?.kind, resetsAt: resetsAt !== undefined && Number.isFinite(resetsAt) ? resetsAt : undefined },
     next: freest && status ? { profile: freest, status } : null,
-    early: tightest.pct,
+    early: window?.percentUsed ?? autoAt,
   };
 }
 
@@ -143,9 +155,8 @@ export function sessionIdFromArgs(args: string[]): string | undefined {
  * The args to carry a session over to another subscription: the user's own flags
  * (permissions, extra dirs, MCP config, …) plus `--resume <id>`. Whatever picked the old
  * session is dropped, and so is a leading prompt, which would otherwise be sent again.
- * `prompt`, when given, is sent as the resumed session's first message.
  */
-export function continuationArgs(original: string[], sessionId: string, prompt?: string): string[] {
+export function continuationArgs(original: string[], sessionId: string): string[] {
   // ponytail: a prompt placed after other flags looks like a flag's value and is kept;
   // telling them apart needs claude's own flag table.
   const kept: string[] = [];
@@ -163,12 +174,8 @@ export function continuationArgs(original: string[], sessionId: string, prompt?:
     }
     kept.push(arg);
   }
-  return [...kept, '--resume', sessionId, ...(prompt ? [prompt] : [])];
+  return [...kept, '--resume', sessionId];
 }
-
-/** What a session moved after its turn was cut short is told first, unless configured
- *  otherwise: without it, the conversation sits at an empty prompt until someone types. */
-export const DEFAULT_RESUME_PROMPT = 'Continue where you left off.';
 
 /** One launch of the CLI: how it exited and which session it ended on. */
 export interface LaunchResult {
@@ -182,23 +189,37 @@ export interface LaunchResult {
   /** The mod ended the session on its own (`continuation.auto_at`): nobody is there to
    *  ask, and the session must carry on somewhere — here, if nowhere has more room. */
   autoMoved?: boolean;
+  /** The window the mod moved it on, as the session read it. */
+  autoWindow?: AutoWindow;
+}
+
+/** How one launch starts, beyond its args. */
+export interface LaunchOptions {
+  /** A window the mod must not move this session on again (`<kind>:<resetsAt>`): it just
+   *  tried, and there was nowhere to go. A later window — a reset, or the other kind —
+   *  still moves it. */
+  holdWindow?: string;
+  /** Sent as the resumed session's first message, by the mod once the session is up. */
+  resumePrompt?: string;
 }
 
 /** What the loop needs from the outside world — the CLI wires the real ones. */
 export interface RunDeps {
   /** Everything a profile needs right before the CLI starts under it. */
   prepare(profile: string): void;
-  /** `holdAuto`: this launch resumes a session the mod just tried to move and could not —
-   *  the mod must not try again in it, or a figure the two read differently would end the
-   *  session after every turn. */
-  launch(profile: string, args: string[], opts?: { holdAuto?: boolean }): Promise<LaunchResult>;
-  plan(profile: string, session: { id?: string; since: number; autoMoved?: boolean }): Promise<ContinuationPlan | null>;
+  launch(profile: string, args: string[], opts?: LaunchOptions): Promise<LaunchResult>;
+  plan(profile: string, session: { id?: string; since: number; autoMoved?: boolean; autoWindow?: AutoWindow }): Promise<ContinuationPlan | null>;
   ask(question: string): boolean;
   say(line: string): void;
-  /** Sent as the first message of a session moved because its window ran out — the turn
-   *  under way was cut short, so the work picks up again. Absent or empty: none. */
-  resumePrompt?: string;
+  /** The first message of a session moved because its window ran out, so the turn that
+   *  was cut short picks up again (`continuation.resume_prompt`). A string: after every
+   *  such move. `false`: never. Absent: after an automatic move only — DEFAULT_RESUME_PROMPT —
+   *  since someone who answered the question or ran /exit is there to say what next. */
+  resumePrompt?: string | false;
 }
+
+/** What a session moved on its own after a spent window is told first, by default. */
+export const DEFAULT_RESUME_PROMPT = 'Continue where you left off.';
 
 /** Claude's window names, in the words its own status line uses. */
 function describeWindow(rateLimitType: string | undefined): string {
@@ -207,10 +228,18 @@ function describeWindow(rateLimitType: string | undefined): string {
   return 'usage';
 }
 
+/** The first message for a session that moved after `run` ended on a spent window. */
+function resumePromptFor(deps: RunDeps, run: LaunchResult): string | undefined {
+  if (deps.resumePrompt === false) return undefined;
+  if (typeof deps.resumePrompt === 'string') return deps.resumePrompt || undefined;
+  return run.autoMoved ? DEFAULT_RESUME_PROMPT : undefined;
+}
+
 /**
  * Run the CLI under a profile and, each time its session stops on a spent window,
  * carry that same session over to the subscription with the most room — asking first,
- * unless the person already agreed inside claude. Returns the last launch's exit code.
+ * unless the person already agreed inside claude, or the mod moved it on its own.
+ * Returns the last launch's exit code.
  *
  * `continuable`: an interactive claude session. A subcommand or `-p` run has no
  * conversation to carry on, and without a terminal there is nobody to ask.
@@ -226,11 +255,12 @@ export async function runWithContinuation(
   let run = await deps.launch(current, cliArgs);
 
   while (continuable) {
-    const plan = await deps.plan(current, { id: run.sessionId, since: run.since, autoMoved: run.autoMoved });
+    const plan = await deps.plan(current, { id: run.sessionId, since: run.since, autoMoved: run.autoMoved, autoWindow: run.autoWindow });
 
-    // The mod ended the session to move it, and there is nowhere better to go: the
-    // session carries on where it was rather than leave the person at a shell.
-    if (run.autoMoved && (!plan || !plan.next)) {
+    // The mod ended the session to move it early, and there is nowhere below the line to
+    // go (or its window reset meanwhile): the session carries on where it was rather than
+    // leave the person at a shell. A spent window with nowhere to go is reported below.
+    if (run.autoMoved && (!plan || (plan.early !== undefined && !plan.next))) {
       const sessionId = plan?.sessionId ?? run.sessionId;
       const why = plan
         ? `no other claude subscription has more room, so it stays on ${current}`
@@ -242,7 +272,8 @@ export async function runWithContinuation(
       }
       deps.say(`\naimux ended this session to move it, but ${why}. Resuming it.`);
       deps.prepare(current);
-      run = await deps.launch(current, continuationArgs(cliArgs, sessionId), { holdAuto: true });
+      const hold = run.autoWindow ? `${run.autoWindow.kind}:${run.autoWindow.resetsAt ?? ''}` : undefined;
+      run = await deps.launch(current, continuationArgs(cliArgs, sessionId), { holdWindow: hold });
       continue;
     }
 
@@ -276,12 +307,12 @@ export async function runWithContinuation(
       break;
     }
 
+    // Only a spent window cuts a turn short. A move before that (`early`) happens between
+    // turns, after an answer, so there is nothing to pick up again.
+    const resumePrompt = plan.early === undefined ? resumePromptFor(deps, run) : undefined;
     current = plan.next.profile;
     deps.prepare(current);
-    // Only a spent window cut a turn short. A move before that (`early`) happens between
-    // turns, after an answer, so there is nothing to pick up again.
-    const prompt = plan.early === undefined ? deps.resumePrompt : undefined;
-    run = await deps.launch(current, continuationArgs(cliArgs, plan.sessionId, prompt));
+    run = await deps.launch(current, continuationArgs(cliArgs, plan.sessionId), resumePrompt ? { resumePrompt } : undefined);
   }
 
   return run.code;

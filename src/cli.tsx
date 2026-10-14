@@ -2,6 +2,7 @@
 import { Command } from 'commander';
 import type { AimuxConfig } from './types/index.js';
 import type { ProfileUsageSummary, RateLimitProbe } from './core/index.js';
+import type { AutoWindow, LaunchOptions } from './core/index.js';
 import { rmSync, existsSync, cpSync, mkdirSync, appendFileSync, readFileSync } from 'node:fs';
 import { spawnSync, execFileSync } from 'node:child_process';
 import { isatty } from 'node:tty';
@@ -17,7 +18,7 @@ import {
   loadProfileEnv, collectApiCredentials, collectProviderCredentials, PROVIDER_PRESETS, writeProfileDotEnv, mergeProfileDotEnv, checkDotenvPermissions, seedClaudeOnboarding, confirm,
   parseShell, buildSwitchEnv, renderShellExports, renderShellInit,
   fetchRateLimits, rateLimitProfiles, pickFreestProfile, limitsSnapshot,
-  planContinuation, runWithContinuation, DEFAULT_RESUME_PROMPT, fmtPct, openSplit, posixQuote, baseEnvFor,
+  planContinuation, runWithContinuation, fmtPct, openSplit, posixQuote, baseEnvFor,
   sessionIdFromArgs, followProcessSession, keepOpenOnFailure,
   startDashboard, openBrowser, liveData, serveMcp,
 } from './core/index.js';
@@ -83,18 +84,26 @@ function askYes(question: string): boolean {
  * to move the session to (they ran the `/exit` it offered once theirs ran out), or
  * nothing. Read once: the file goes with it.
  */
-function takeHandoff(path: string): { profile?: string; auto: boolean } {
+function takeHandoff(path: string): { profile?: string; auto: boolean; window?: AutoWindow } {
   if (!existsSync(path)) return { auto: false };
 
   const text = readFileSync(path, 'utf-8').trim();
   rmSync(path, { force: true });
 
   // The mod writes JSON when it ended the session on its own (`continuation.auto_at`),
-  // a bare profile name when the person ran the /exit it offered.
+  // with the window it read live; a bare profile name when the person ran the /exit it
+  // offered; nothing (an emptied file) when an automatic /exit it asked for never ran.
   if (text.startsWith('{')) {
     try {
-      const { profile, auto } = JSON.parse(text) as { profile?: unknown; auto?: unknown };
-      return { profile: typeof profile === 'string' && profile ? profile : undefined, auto: auto === true };
+      const { profile, auto, window } = JSON.parse(text) as { profile?: unknown; auto?: unknown; window?: unknown };
+      const w = window as { kind?: unknown; percentUsed?: unknown; resetsAt?: unknown } | undefined;
+      const isWindow = !!w && typeof w.kind === 'string' && typeof w.percentUsed === 'number'
+        && (w.resetsAt === undefined || typeof w.resetsAt === 'string');
+      return {
+        profile: typeof profile === 'string' && profile ? profile : undefined,
+        auto: auto === true && typeof profile === 'string' && profile !== '',
+        window: isWindow ? (w as AutoWindow) : undefined,
+      };
     } catch {
       return { auto: false };
     }
@@ -483,7 +492,7 @@ program
       // the args name, then (in planContinuation) the transcript this profile wrote last.
       // `moveAgreed`: the person already said yes inside claude, by running the mod's /exit.
       const autoAt = config.continuation?.auto_at;
-      const launch = async (profile: string, extraArgs: string[], opts: { holdAuto?: boolean } = {}) => {
+      const launch = async (profile: string, extraArgs: string[], opts: LaunchOptions = {}) => {
         let follower: ReturnType<typeof followProcessSession> | undefined;
         const since = Date.now();
         const handoff = withMod ? join(getAimuxDir(), 'handoff', `${process.pid}-${launches++}`) : undefined;
@@ -496,7 +505,11 @@ program
               // execArgv too: under tsx (npm run dev) the loader flags are what run a .tsx entry
               AIMUX_SELF: JSON.stringify([process.execPath, ...process.execArgv, process.argv[1]]),
               AIMUX_HANDOFF: handoff,
-              ...(autoAt !== undefined && !opts.holdAuto ? { AIMUX_AUTO_AT: String(autoAt) } : {}),
+              // Always set, empty when off: a value inherited from an aimux-launched parent
+              // must not switch the mod on in a launch whose config says otherwise.
+              AIMUX_AUTO_AT: autoAt !== undefined ? String(autoAt) : '',
+              AIMUX_AUTO_HOLD: opts.holdWindow ?? '',
+              AIMUX_RESUME_PROMPT: opts.resumePrompt ?? '',
             }
             : undefined,
           onSpawn: continuable
@@ -511,6 +524,7 @@ program
           since,
           moveAgreed: agreed.profile,
           autoMoved: agreed.auto,
+          autoWindow: agreed.window,
           sessionId: follower?.current() ?? sessionIdFromArgs(extraArgs),
         };
       };
@@ -519,12 +533,10 @@ program
         prepare,
         launch,
         plan: (name, session) => planContinuation(config, name, session, undefined, undefined,
-          { autoAt: session.autoMoved ? autoAt : undefined }),
+          { autoAt: session.autoMoved ? autoAt : undefined, window: session.autoWindow }),
         ask: askYes,
         say: (line) => console.error(line),
-        resumePrompt: config.continuation?.resume_prompt === false
-          ? undefined
-          : config.continuation?.resume_prompt ?? DEFAULT_RESUME_PROMPT,
+        resumePrompt: config.continuation?.resume_prompt,
       });
 
       process.exit(exitCode);

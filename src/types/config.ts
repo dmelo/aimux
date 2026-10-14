@@ -31,12 +31,14 @@ export interface AimuxConfig {
 /** How a session moves to another subscription as its own runs low. */
 export interface ContinuationConfig {
   /** Move on its own, without asking, once a window of this session's subscription has
-   *  used this percentage (1–100): after the turn that crossed it ends, and only to a
-   *  subscription whose every window is below it. Absent: ask once a window is spent. */
+   *  used this percentage (1–100), when the turn that crossed it ends: only to a
+   *  subscription whose every window is below it, and not while background work or a
+   *  draft would be lost. A spent window (a refused turn) moves to any subscription with
+   *  room, as the question would. Absent: ask once a window is spent. */
   auto_at?: number;
-  /** The first message of a session moved because its window ran out, so the work it
-   *  was doing carries on by itself. Default "Continue where you left off."; `false`
-   *  resumes it at an empty prompt. */
+  /** The first message of a session moved because its window ran out, so the turn that
+   *  was cut short picks up again. Absent: "Continue where you left off." after an
+   *  automatic move only; a string: that, after every such move; `false`: never. */
   resume_prompt?: string | false;
 }
 

@@ -4,6 +4,20 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/) and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- **`continuation.auto_at`** moves a session to another subscription on its own, without
+  asking, once a window of its subscription reaches that percentage: when the turn under
+  way ends, and only to a subscription below the line on both windows. It waits while
+  background work, a waiting subagent, a scheduled wakeup or a draft in the prompt would
+  be lost, never moves after an interrupt, and with nowhere below the line keeps the
+  session where it is. A turn refused over a spent window moves straight away.
+- **`continuation.resume_prompt`**: a session moved because its window ran out is
+  resumed with a first message, so the turn that was cut short picks up again —
+  "Continue where you left off." after an automatic move by default; a string sends it
+  after every such move, `false` never.
+
 ## [0.34.0] - 2026-10-13
 
 ### Added
