@@ -34,6 +34,10 @@ export interface ContinuationConfig {
    *  used this percentage (1–100): after the turn that crossed it ends, and only to a
    *  subscription whose every window is below it. Absent: ask once a window is spent. */
   auto_at?: number;
+  /** The first message of a session moved because its window ran out, so the work it
+   *  was doing carries on by itself. Default "Continue where you left off."; `false`
+   *  resumes it at an empty prompt. */
+  resume_prompt?: string | false;
 }
 
 

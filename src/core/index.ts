@@ -104,7 +104,7 @@ export { formatTranscript } from './logs.js';
 
 export { sessionOwners, ownerAt, sessionTouchedSince, followProcessSession, findTranscript, sessionQuotaHit } from './sessionMarkers.js';
 export type { QuotaHit, SessionOwner } from './sessionMarkers.js';
-export { planContinuation, continuationArgs, sessionIdFromArgs, runWithContinuation } from './continuation.js';
+export { planContinuation, continuationArgs, sessionIdFromArgs, runWithContinuation, DEFAULT_RESUME_PROMPT } from './continuation.js';
 export type { LaunchResult, RunDeps } from './continuation.js';
 export type { ContinuationPlan } from './continuation.js';
 export { openSplit, keepOpenOnFailure } from './split.js';

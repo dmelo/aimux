@@ -375,3 +375,51 @@ describe('runWithContinuation — moving on its own', () => {
     expect(seen.held).toEqual([false, true]);
   });
 });
+
+describe('runWithContinuation — picking the work up again', () => {
+  const room = (profile: string) => ({ profile, status: { fiveHourPct: 10, weeklyPct: 20 } });
+  const HIT: ContinuationPlan['hit'] = { rateLimitType: 'five_hour' };
+
+  function scripted(plans: Array<ContinuationPlan | null>, run: { agreed?: string; auto?: boolean } = {}) {
+    const launches: Array<[string, string[]]> = [];
+    const deps: RunDeps = {
+      prepare: () => {},
+      launch: async (profile, args) => {
+        const n = launches.push([profile, args]) - 1;
+        return { code: 0, since: n, sessionId: `s${n}`, moveAgreed: n === 0 ? run.agreed : undefined, autoMoved: n === 0 && run.auto };
+      },
+      plan: async () => plans.shift() ?? null,
+      ask: () => true,
+      say: () => {},
+      resumePrompt: 'Continue where you left off.',
+    };
+    return { launches, deps };
+  }
+
+  it('tells a session whose turn the spent window cut short to carry on, however the move was agreed', async () => {
+    for (const run of [{}, { agreed: 'spare' }, { auto: true }]) {
+      const { launches, deps } = scripted([{ sessionId: 'abc', hit: HIT, next: room('spare') }, null], run);
+      await runWithContinuation('work', ['--add-dir', 'x'], true, deps);
+      expect(launches[1]).toEqual(['spare', ['--add-dir', 'x', '--resume', 'abc', 'Continue where you left off.']]);
+    }
+  });
+
+  it('sends nothing after an early move: that one happened between turns', async () => {
+    const { launches, deps } = scripted([{ sessionId: 'abc', hit: HIT, next: room('spare'), early: 96 }, null], { auto: true });
+    await runWithContinuation('work', [], true, deps);
+    expect(launches[1]).toEqual(['spare', ['--resume', 'abc']]);
+  });
+
+  it('sends nothing when the session resumes where it was', async () => {
+    const { launches, deps } = scripted([{ sessionId: 'abc', hit: HIT, next: null, early: 96 }, null], { auto: true });
+    await runWithContinuation('work', [], true, deps);
+    expect(launches[1]).toEqual(['work', ['--resume', 'abc']]);
+  });
+
+  it('sends nothing when no prompt is configured', async () => {
+    const { launches, deps } = scripted([{ sessionId: 'abc', hit: HIT, next: room('spare') }, null]);
+    deps.resumePrompt = undefined;
+    await runWithContinuation('work', [], true, deps);
+    expect(launches[1]).toEqual(['spare', ['--resume', 'abc']]);
+  });
+});

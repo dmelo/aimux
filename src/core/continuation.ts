@@ -143,8 +143,9 @@ export function sessionIdFromArgs(args: string[]): string | undefined {
  * The args to carry a session over to another subscription: the user's own flags
  * (permissions, extra dirs, MCP config, …) plus `--resume <id>`. Whatever picked the old
  * session is dropped, and so is a leading prompt, which would otherwise be sent again.
+ * `prompt`, when given, is sent as the resumed session's first message.
  */
-export function continuationArgs(original: string[], sessionId: string): string[] {
+export function continuationArgs(original: string[], sessionId: string, prompt?: string): string[] {
   // ponytail: a prompt placed after other flags looks like a flag's value and is kept;
   // telling them apart needs claude's own flag table.
   const kept: string[] = [];
@@ -162,8 +163,12 @@ export function continuationArgs(original: string[], sessionId: string): string[
     }
     kept.push(arg);
   }
-  return [...kept, '--resume', sessionId];
+  return [...kept, '--resume', sessionId, ...(prompt ? [prompt] : [])];
 }
+
+/** What a session moved after its turn was cut short is told first, unless configured
+ *  otherwise: without it, the conversation sits at an empty prompt until someone types. */
+export const DEFAULT_RESUME_PROMPT = 'Continue where you left off.';
 
 /** One launch of the CLI: how it exited and which session it ended on. */
 export interface LaunchResult {
@@ -190,6 +195,9 @@ export interface RunDeps {
   plan(profile: string, session: { id?: string; since: number; autoMoved?: boolean }): Promise<ContinuationPlan | null>;
   ask(question: string): boolean;
   say(line: string): void;
+  /** Sent as the first message of a session moved because its window ran out — the turn
+   *  under way was cut short, so the work picks up again. Absent or empty: none. */
+  resumePrompt?: string;
 }
 
 /** Claude's window names, in the words its own status line uses. */
@@ -270,7 +278,10 @@ export async function runWithContinuation(
 
     current = plan.next.profile;
     deps.prepare(current);
-    run = await deps.launch(current, continuationArgs(cliArgs, plan.sessionId));
+    // Only a spent window cut a turn short. A move before that (`early`) happens between
+    // turns, after an answer, so there is nothing to pick up again.
+    const prompt = plan.early === undefined ? deps.resumePrompt : undefined;
+    run = await deps.launch(current, continuationArgs(cliArgs, plan.sessionId, prompt));
   }
 
   return run.code;

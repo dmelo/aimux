@@ -226,6 +226,10 @@ export function validateConfig(config: unknown): string[] {
         && (typeof k.auto_at !== 'number' || !Number.isFinite(k.auto_at) || k.auto_at < 1 || k.auto_at > 100)) {
       errors.push('continuation.auto_at must be a number from 1 to 100');
     }
+    if (k && typeof k === 'object' && !Array.isArray(k) && k.resume_prompt !== undefined
+        && k.resume_prompt !== false && typeof k.resume_prompt !== 'string') {
+      errors.push('continuation.resume_prompt must be a string, or false');
+    }
   }
 
   return errors;

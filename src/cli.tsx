@@ -17,7 +17,7 @@ import {
   loadProfileEnv, collectApiCredentials, collectProviderCredentials, PROVIDER_PRESETS, writeProfileDotEnv, mergeProfileDotEnv, checkDotenvPermissions, seedClaudeOnboarding, confirm,
   parseShell, buildSwitchEnv, renderShellExports, renderShellInit,
   fetchRateLimits, rateLimitProfiles, pickFreestProfile, limitsSnapshot,
-  planContinuation, runWithContinuation, fmtPct, openSplit, posixQuote, baseEnvFor,
+  planContinuation, runWithContinuation, DEFAULT_RESUME_PROMPT, fmtPct, openSplit, posixQuote, baseEnvFor,
   sessionIdFromArgs, followProcessSession, keepOpenOnFailure,
   startDashboard, openBrowser, liveData, serveMcp,
 } from './core/index.js';
@@ -522,6 +522,9 @@ program
           { autoAt: session.autoMoved ? autoAt : undefined }),
         ask: askYes,
         say: (line) => console.error(line),
+        resumePrompt: config.continuation?.resume_prompt === false
+          ? undefined
+          : config.continuation?.resume_prompt ?? DEFAULT_RESUME_PROMPT,
       });
 
       process.exit(exitCode);

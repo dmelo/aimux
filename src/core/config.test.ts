@@ -173,6 +173,14 @@ describe('continuation config validation', () => {
     }
     expect(validateConfig({ ...config, continuation: 95 })).toEqual(['continuation must be an object']);
   });
+
+  it('takes resume_prompt as a string or false, nothing else', () => {
+    const config = createDefaultConfig('~/.claude');
+    for (const resume_prompt of ['carry on', false]) expect(validateConfig({ ...config, continuation: { resume_prompt } })).toEqual([]);
+    for (const resume_prompt of [true, 3, null]) {
+      expect(validateConfig({ ...config, continuation: { resume_prompt } })).toEqual(['continuation.resume_prompt must be a string, or false']);
+    }
+  });
 });
 
 describe('bindings config validation', () => {
